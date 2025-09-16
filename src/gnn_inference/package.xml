@@ -9,7 +9,12 @@
 
   <depend>rclpy</depend>
   <depend>torch</depend>
-  <depend>gnn_interfaces</depend>
+
+  <!-- Interface dependency (custom message package) -->
+<build_depend>geometry_msgs</build_depend>
+<exec_depend>geometry_msgs</exec_depend>
+
+
   <test_depend>ament_copyright</test_depend>
   <test_depend>ament_flake8</test_depend>
   <test_depend>ament_pep257</test_depend>

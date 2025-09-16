@@ -3,7 +3,7 @@ from rclpy.node import Node
 from sensor_msgs.msg import PointCloud2, PointField
 import sensor_msgs_py.point_cloud2 as pc2
 from std_msgs.msg import Header
-from geometry_msgs.msg import TransformStamped
+from geometry_msgs.msg import TransformStamped,PoseWithCovarianceStamped
 from collections import deque
 import numpy as np
 import json
@@ -17,9 +17,12 @@ import argparse
 from gnn_interfaces.msg import GraphData
 from rclpy.parameter import Parameter
 import argparse
-from gnn_interfaces.msg import GraphData
 from rclpy.parameter import Parameter
 import tf2_ros
+import os ,csv
+from datetime import datetime
+import time
+from rclpy.clock import Clock
 
 
 def create_pointcloud2_from_numpy(points, frame_id="map"):
@@ -68,7 +71,7 @@ def pointcloud2_to_xyz_intensity(msg: PointCloud2):
 class DataMergerNode(Node):
 
 
-    def __init__(self, visualize=False, simulation=False):
+    def __init__(self, visualize=True, simulation=False):
         super().__init__('data_merger_node')
 
         self.simulation = simulation
@@ -77,6 +80,8 @@ class DataMergerNode(Node):
 
         self.pose_buffer = {'rm04': deque(maxlen=1000), 'rm03': deque(maxlen=1000)}  # Always safe to define
 
+
+        self.clock = Clock()
 
         # if self.simulation:
         #     self.timestamps_rm04 = self.load_timestamps('timestamps_rm04.json')
@@ -88,8 +93,8 @@ class DataMergerNode(Node):
         self.timestamps_rm03 = []
         self.current_idx = {'rm04': 0, 'rm03': 0}
 
-        self.create_subscription(TransformStamped, '/rm04/vicon_pose', self.vicon_callback_rm04, 10)
-        self.create_subscription(TransformStamped, '/rm03/vicon_pose', self.vicon_callback_rm03, 10)
+        self.create_subscription(PoseWithCovarianceStamped, '/rm04/vicon_pose', self.vicon_callback_rm04, 10)
+        self.create_subscription(PoseWithCovarianceStamped, '/rm03/vicon_pose', self.vicon_callback_rm03, 10)
 
         self.radar_buffer = {'rm04': deque(maxlen=1000), 'rm03': deque(maxlen=1000)}
 
@@ -99,20 +104,50 @@ class DataMergerNode(Node):
         self.tf_buffer = tf2_ros.Buffer()
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
 
-        self.create_timer(0.01, self.sync_and_merge)
+        self.create_timer(0.03, self.sync_and_merge)
         self.graph_pub = self.create_publisher(GraphData, '/graph_data', 10)
 
         self.get_logger().info("Data Merger Node Initialized")
         self.merged_data_buffer = deque(maxlen=100)
-        self.N = 5
+        # self.N = 5
         self.temporal_threshold = 2.0
 
         with open('normalization_weights_unified.pkl', 'rb') as f:
             self.norm_weights = pickle.load(f)
             print(f"✅ Norm weight has been loaded ")
 
-        self.raw_pc_pub = self.create_publisher(PointCloud2, "/radar_points_raw", 10)
+        # self.raw_pc_pub = self.create_publisher(PointCloud2, "/radar_points_raw", 10)
         self.visualizer = GraphVisualizer(self, frame_id="map") if visualize else None
+
+        # --- Retrieve parameters ---
+        self.declare_parameter("run_id", "default_run")
+        self.run_id = self.get_parameter("run_id").get_parameter_value().string_value
+
+        self.declare_parameter("window_size", 3)
+        self.N = self.get_parameter("window_size").get_parameter_value().integer_value
+
+        # --- Create logging folder ---
+        timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        self.log_dir = os.path.join("datalogging/data_merge", f"{self.run_id}_{timestamp}")
+        os.makedirs(self.log_dir, exist_ok=True)
+
+        # --- CSV log file path ---
+        self.csv_path = os.path.join(self.log_dir, "data_merger_log.csv")
+
+        # --- Initialize CSV log file ---
+        with open(self.csv_path, mode='w', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                "timestamp_ros", "run_id", "window_size",
+                "rm04_points", "rm03_points",
+                "node_count", "edge_count", "inter_robot_edge_count",
+                "graph_build_time_ms", "megre_latency", "vicon_delay_rm04_ms", "vicon_delay_rm03_ms"
+            ])
+
+        self.last_radar_timestamp = {'rm04': 0.0, 'rm03': 0.0}
+        self.last_vicon_timestamp = {'rm04': 0.0, 'rm03': 0.0}
+
+
 
 
     def load_timestamps(self, filepath):
@@ -139,8 +174,8 @@ class DataMergerNode(Node):
             
         self.radar_buffer['rm04'].append((timestamp, points))
         self.radar_buffer['rm04'] = deque([(ts, pts) for ts, pts in self.radar_buffer['rm04'] if timestamp - ts < 2.0], maxlen=1000)
-
-        self.get_logger().debug(f"rm04 radar buffered with timestamp {timestamp:.6f}")
+        self.last_radar_timestamp['rm04'] = timestamp
+        # self.get_logger().debug(f"rm04 radar buffered with timestamp {timestamp:.6f}")
 
     def radar_callback_rm03(self, msg):
         #if self.current_idx['rm03'] >= len(self.timestamps_rm03):
@@ -158,7 +193,7 @@ class DataMergerNode(Node):
 
         self.radar_buffer['rm03'].append((timestamp, points))
         self.radar_buffer['rm03'] = deque([(ts, pts) for ts, pts in self.radar_buffer['rm03'] if timestamp - ts < 2.0], maxlen=1000)
-
+        self.last_radar_timestamp['rm03'] = timestamp
         #self.get_logger().debug(f"rm03 radar buffered with timestamp {timestamp:.6f}")
 
     def vicon_callback_rm04(self, msg):
@@ -166,38 +201,58 @@ class DataMergerNode(Node):
         pose = {
             'timestamp': timestamp,
             'translation': np.array([
-                msg.transform.translation.x,
-                msg.transform.translation.y,
-                msg.transform.translation.z
+                msg.pose.pose.position.x,
+                msg.pose.pose.position.y,
+                msg.pose.pose.position.z
             ]),
             'rotation': np.array([
-                msg.transform.rotation.x,
-                msg.transform.rotation.y,
-                msg.transform.rotation.z,
-                msg.transform.rotation.w
+                msg.pose.pose.orientation.x,
+                msg.pose.pose.orientation.y,
+                msg.pose.pose.orientation.z,
+                msg.pose.pose.orientation.w
             ])
         }
         self.pose_buffer['rm04'].append((timestamp, pose))
-        #self.get_logger().debug(f"rm04 Vicon pose buffered with timestamp {timestamp:.6f}")
+        self.last_vicon_timestamp['rm04'] = timestamp
 
     def vicon_callback_rm03(self, msg):
         timestamp = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
         pose = {
             'timestamp': timestamp,
             'translation': np.array([
-                msg.transform.translation.x,
-                msg.transform.translation.y,
-                msg.transform.translation.z
+                msg.pose.pose.position.x,
+                msg.pose.pose.position.y,
+                msg.pose.pose.position.z
             ]),
             'rotation': np.array([
-                msg.transform.rotation.x,
-                msg.transform.rotation.y,
-                msg.transform.rotation.z,
-                msg.transform.rotation.w
+                msg.pose.pose.orientation.x,
+                msg.pose.pose.orientation.y,
+                msg.pose.pose.orientation.z,
+                msg.pose.pose.orientation.w
             ])
         }
         self.pose_buffer['rm03'].append((timestamp, pose))
+        self.last_vicon_timestamp['rm03'] = timestamp
         #self.get_logger().debug(f"rm03 Vicon pose buffered with timestamp {timestamp:.6f}")
+
+    def log_graph_stats(self, metadata):
+        with open(self.csv_path, mode='a', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                metadata["timestamp_ros"],
+                metadata["run_id"],
+                metadata["window_size"],
+                metadata["rm04_points"],
+                metadata["rm03_points"],
+                metadata["node_count"],
+                metadata["edge_count"],
+                metadata["inter_robot_edge_count"],
+                metadata["graph_valid"],
+                round(metadata["build_time_ms"], 2),
+                round(metadata["vicon_delay_rm04_ms"], 2),
+                round(metadata["vicon_delay_rm03_ms"], 2),
+            ])
+
 
     def get_closest(self, buffer, ref_time, max_diff=1.0):
         """Return the closest data in buffer to ref_time within max_diff seconds."""
@@ -292,15 +347,21 @@ class DataMergerNode(Node):
 
         for pt in points:
             x, y, z, snr = pt
-
+            if (x < 0.3  and y <= 0.3):
+                self.get_logger().debug(f"[SKIP] {robot_name} point: too close to the robot → x={x:.2f}, y={y:.2f}, z={z:.2f}")
+                continue
             x_local, y_local, z_local = x, y, z
             p_local = np.array([x_local, y_local, z_local])
             p_global = R.from_quat(quaternion).apply(p_local) + translation
-
+            
             xg, yg, zg = p_global
-            if not (-10.0 <= xg <= 10.0 and -5.0 <= yg <= 5.0):
+            # if not (-10.0 <= xg <= 10.0 and -5.0 <= yg <= 5.0):
+            #     self.get_logger().debug(f"[SKIP] {robot_name} point out of bounds → x={xg:.2f}, y={yg:.2f}, z={zg:.2f}")
+            #     continue
+            if not (-12.0 <= xg <= 10.0 and -5.0 <= yg <= 7.0):
                 self.get_logger().debug(f"[SKIP] {robot_name} point out of bounds → x={xg:.2f}, y={yg:.2f}, z={zg:.2f}")
                 continue
+
 
             point_data = self.calculate_metrics(
                 xg, yg, zg, snr, robot_name, bag_timestamp, robot_id
@@ -316,8 +377,8 @@ class DataMergerNode(Node):
                     'x': xv, 'y': yv, 'z': zv,
                     'robot_prefix_num': robot_name
                 })
-        self.get_logger().info(f"[PROCESS] {robot_name.upper()} processing {len(points)} raw points")
-        self.get_logger().info(f"[PROCESS] {robot_name.upper()} → radar_points={len(radar_points)}, viz_points={len(viz_points) if viz_points else 'N/A'}")
+        # self.get_logger().info(f"[PROCESS] {robot_name.upper()} processing {len(points)} raw points")
+        # self.get_logger().info(f"[PROCESS] {robot_name.upper()} → radar_points={len(radar_points)}, viz_points={len(viz_points) if viz_points else 'N/A'}")
 
         return radar_points, viz_points
 
@@ -438,6 +499,9 @@ class DataMergerNode(Node):
 
     def publish_graph(self, node_features, edge_index, edge_attr):
         msg = GraphData()
+        # msg.header = std_msgs.msg.Header()
+        msg.header.frame_id = "map"
+        msg.header.stamp = self.get_clock().now().to_msg()
         msg.node_features = node_features.flatten().tolist()
         msg.node_feature_dim = node_features.shape[1] if node_features.ndim == 2 else 0
 
@@ -454,25 +518,58 @@ class DataMergerNode(Node):
 
         self.graph_pub.publish(msg)
 
+    def prune_buffer(self, buffer_dict, max_age, now):
+        for key in buffer_dict:
+            buffer_dict[key] = [
+                (t, data) for (t, data) in buffer_dict[key]
+                if now - t < max_age
+            ]
 
+    def prune_merged_data_buffer(self, max_age, now):
+        self.merged_data_buffer = [
+            frame for frame in self.merged_data_buffer
+            if now - frame['timestamp'] < max_age
+        ]
 
     def sync_and_merge(self):
+        merge_start_time = time.perf_counter()
+
         #self.get_logger().info("[SYNC] Using TF-based poses; no internal pose_buffer")
 
+        # Abort if no radar data at all
         if not self.radar_buffer['rm04'] and not self.radar_buffer['rm03']:
+            self.get_logger().warn("Skipping graph: No radar data in either buffer.")
             return
 
-        ref_timestamp = self.radar_buffer['rm04'][-1][0] if self.radar_buffer['rm04'] else self.radar_buffer['rm03'][-1][0]
-        #self.get_logger().info(f"[SYNC] Reference timestamp: {ref_timestamp:.3f}")
+        now = self.clock.now().nanoseconds * 1e-9
+        fresh_threshold = 0.75  # seconds
 
+        # Determine latest timestamps per robot (0 if buffer empty)
+        latest_rm04_ts = self.radar_buffer['rm04'][-1][0] if self.radar_buffer['rm04'] else 0
+        latest_rm03_ts = self.radar_buffer['rm03'][-1][0] if self.radar_buffer['rm03'] else 0
+
+        # Ensure at least one radar message is fresh
+        if (now - latest_rm04_ts > fresh_threshold) and (now - latest_rm03_ts > fresh_threshold):
+            self.get_logger().warn("Skipping graph: No fresh radar data from rm04 or rm03.")
+            return
+
+        # Choose the reference timestamp for merging (latest available)
+        if self.radar_buffer['rm04']:
+            ref_timestamp = self.radar_buffer['rm04'][-1][0]
+        elif self.radar_buffer['rm03']:
+            ref_timestamp = self.radar_buffer['rm03'][-1][0]
+        else:
+            self.get_logger().warn("Skipping graph: Could not determine reference timestamp.")
+            return
+
+        # Get the radar scans closest to the reference timestamp
         rm04_radar = self.get_closest(self.radar_buffer['rm04'], ref_timestamp)
         rm03_radar = self.get_closest(self.radar_buffer['rm03'], ref_timestamp)
 
-
-        if rm03_radar:
-            self.get_logger().info(f"[SYNC] Found RM03 radar at {rm03_radar[0]:.3f}")
-        else:
-            self.get_logger().warn("[SYNC] No RM03 radar found near reference timestamp")
+        # if rm03_radar:
+        #     self.get_logger().info(f"[SYNC] Found RM03 radar at {rm03_radar[0]:.3f}")
+        # else:
+        #     self.get_logger().warn("[SYNC] No RM03 radar found near reference timestamp")
 
         merged_data = {
             'timestamp': ref_timestamp,
@@ -483,14 +580,14 @@ class DataMergerNode(Node):
         if rm04_radar:
             gnn_pts, viz_pts = self.process_radar_points(rm04_radar[1], "rm04", rm04_radar[0], "robot_1")
             merged_data['radar_points']['rm04'] = gnn_pts
-            if self.visualizer:
-                self.visualizer.store_visualization_data('rm04', viz_pts)
+            #if self.visualizer:
+            #    self.visualizer.store_visualization_data('rm04', viz_pts)
 
         if rm03_radar:
             gnn_pts, viz_pts = self.process_radar_points(rm03_radar[1], "rm03", rm03_radar[0], "robot_2")
             merged_data['radar_points']['rm03'] = gnn_pts
-            if self.visualizer:
-                self.visualizer.store_visualization_data('rm03', viz_pts)
+            #if self.visualizer:
+            #    self.visualizer.store_visualization_data('rm03', viz_pts)
 
         rm04_pts = len(merged_data['radar_points'].get('rm04', []))
         rm03_pts = len(merged_data['radar_points'].get('rm03', []))
@@ -503,21 +600,21 @@ class DataMergerNode(Node):
             radar_data = merged_data['radar_points'].get(robot_id)
             if radar_data:
                 points_array = np.array([[pt['x'], pt['y'], pt['z']] for pt in radar_data])
-                if len(points_array) >= 9:
+                if len(points_array) >= 15:
                     filtered = statistical_outlier_removal(points_array, k=8, std_ratio=1.0)
                     filtered_set = set(map(tuple, filtered))
                     filtered_points = [pt for pt in radar_data if (pt['x'], pt['y'], pt['z']) in filtered_set]
-                    self.get_logger().info(f"[FILTER] {robot_id}: {len(radar_data)} → {len(filtered_points)} after filtering.")
+                    # self.get_logger().info(f"[FILTER] {robot_id}: {len(radar_data)} → {len(filtered_points)} after filtering.")
                     merged_data['radar_points'][robot_id] = filtered_points
                 else:
                     self.get_logger().info(f"[FILTER] {robot_id}: Not enough points to filter.")
 
         self.merged_data_buffer.append(merged_data)
         #self.get_logger().info(f"[BUFFER] Added to merged buffer. Current size: {len(self.merged_data_buffer)}")
-
+        graph_start_time = time.time()
         window_frames = self.get_recent_window_frames(merged_data['timestamp'])
         graph_data = self.build_graph_from_window(window_frames, self.norm_weights)
-
+        graph_end_time = time.time()
         if graph_data is None:
             self.get_logger().warning("[GNN] Graph construction failed — not enough data.")
             return
@@ -525,16 +622,55 @@ class DataMergerNode(Node):
         if edge_attr.shape[0] == 0 or edge_index.shape[1] == 0:
             self.get_logger().warning("[GNN] Graph invalid — no edges or edge attributes.")
             return
-        positions_only = node_feats[:, :3]
-        raw_pc_msg = create_pointcloud2_from_numpy(positions_only)
-        self.raw_pc_pub.publish(raw_pc_msg)
+
+        merge_end_time = time.perf_counter()
+        internal_merge_latency_ms = (merge_end_time - merge_start_time) * 1000
+
+        #now = time.time()
+        now = self.clock.now().nanoseconds * 1e-9  # ROS time in seconds
+        vicon_delay_rm04 = (now - self.last_vicon_timestamp.get('rm04', now)) * 1000
+        vicon_delay_rm03 = (now - self.last_vicon_timestamp.get('rm03', now)) * 1000
+        radar_delay_rm04 = (now - self.last_radar_timestamp.get('rm04', now)) * 1000
+        radar_delay_rm03 = (now - self.last_radar_timestamp.get('rm03', now)) * 1000
+        
+        inter_robot_edges = int(np.sum([
+            1 for i, j in edge_index.T
+            if node_feats[i, -1] != node_feats[j, -1]
+        ]))
+        with open(self.csv_path, mode='a', newline='') as file:
+            writer = csv.writer(file)
+            writer.writerow([
+                now,                      # timestamp_ros
+                self.run_id,
+                self.N,
+                rm04_pts,
+                rm03_pts,
+                node_feats.shape[0],
+                edge_index.shape[1],
+                inter_robot_edges,
+                round((graph_end_time - graph_start_time) * 1000, 2),  # build time
+                internal_merge_latency_ms,  # compute merge latency if tracked
+                round(vicon_delay_rm04, 2),
+                round(vicon_delay_rm03, 2)
+            ])
+                
+
+        #positions_only = node_feats[:, :3]
+        #raw_pc_msg = create_pointcloud2_from_numpy(positions_only)
+        #self.raw_pc_pub.publish(raw_pc_msg)
 
         self.publish_graph(node_feats, edge_index, edge_attr)
         self.get_logger().info(f"[GNN] Published graph: {node_feats.shape[0]} nodes, {edge_index.shape[1]} edges")
 
-        if self.visualizer:
-            self.visualizer.publish_radar_points()
-            self.visualizer.publish_robot_positions(merged_data["poses"])
+        max_buffer_age = 1.5  # seconds
+
+        self.prune_buffer(self.radar_buffer, max_buffer_age, now)
+        self.prune_buffer(self.pose_buffer, max_buffer_age, now)
+        self.prune_merged_data_buffer(max_buffer_age, now)
+
+        # if self.visualizer:
+            # self.visualizer.publish_radar_points()
+            # self.visualizer.publish_robot_positions(merged_data["poses"])
 
 
 def main(args=None):

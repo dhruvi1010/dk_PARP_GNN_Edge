@@ -1,0 +1,7 @@
+<library path="gnn_objects_layer">
+  <class name="gnn_objects_layer::GNNObjectsLayer"
+         type="gnn_objects_layer::GNNObjectsLayer"
+         base_class_type="nav2_costmap_2d::Layer">
+    <description>Layer that adds GNN-predicted object polygons to the costmap.</description>
+  </class>
+</library>

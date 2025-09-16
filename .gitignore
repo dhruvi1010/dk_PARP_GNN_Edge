@@ -3,5 +3,8 @@ install/
 log/
 *.swp
 *.pyc
+*.csv
+*.pkl
+*.png
 .ccls-cache/
-
+datalogging/
