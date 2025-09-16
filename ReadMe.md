@@ -1,4 +1,4 @@
-# ROS_GNN_ws – Shared Perception for Obstacle Avoidance
+# ROS_GNN_Edge – Shared Perception for Obstacle Avoidance
 
 This workspace provides a **multi-robot perception and obstacle avoidance pipeline** using **Graph Neural Networks (GNNs)**.  
 Radar and pose data are merged across robots, converted into graph structures, processed by a GNN, and used within the **Nav2 costmap layer** for shared obstacle avoidance.  
