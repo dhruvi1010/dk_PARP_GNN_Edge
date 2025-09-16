@@ -8,6 +8,7 @@ from rclpy.node import Node
 #import torch
 from sensor_msgs.msg import PointField
 from geometry_msgs.msg import Point
+from gnn_interfaces.msg import TrackedPolygon
 
 class GraphVisualizer:
     def __init__(self, node: Node, frame_id="map"):
@@ -169,3 +170,4 @@ class GraphVisualizer:
     #         m.lifetime.sec = 1  # auto expire in RViz
     #         marker_array.markers.append(m)
     #     self.robot_pub.publish(marker_array)
+

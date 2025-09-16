@@ -7,7 +7,7 @@ import torch
 import numpy as np
 from sensor_msgs.msg import PointCloud2, PointField
 from visualization_msgs.msg import Marker, MarkerArray
-from geometry_msgs.msg import Point
+from geometry_msgs.msg import Point, PolygonStamped, Point32
 import std_msgs.msg
 import sensor_msgs_py.point_cloud2 as pc2
 import networkx as nx
@@ -18,7 +18,16 @@ from gnn_modules.set_configurations.set_config_gnn import config
 from sklearn.cluster import DBSCAN
 from shapely.geometry import Polygon
 from gnn_modules.tracker.kalman_tracker import ObjectTracker
-import inspect
+import alphashape
+from gnn_interfaces.msg import TrackedPolygon
+from sensor_msgs_py.point_cloud2 import create_cloud
+import os
+import csv
+import yaml
+from datetime import datetime
+import time
+from collections import Counter
+
 #from gnn_inference.model_utils import load_model_pipeline
 
 
@@ -28,7 +37,7 @@ class GNNInferenceNode(Node):
     def __init__(self):
         super().__init__('gnn_inference_node')
 
-        self.octomap_pub = self.create_publisher(PointCloud2, '/octomap_input_points', 10)
+        # self.octomap_pub = self.create_publisher(PointCloud2, '/octomap_input_points', 10)
 
         self.subscription = self.create_subscription(
             GraphData,
@@ -55,7 +64,9 @@ class GNNInferenceNode(Node):
         self.detector = param_obj['detector']
         self.detector.set_param_for_proposal_extraction(eps, compute_adj_mat_from_links=False) 
         self.marker_pub = self.create_publisher(MarkerArray, '/gnn_objects', 10)
-        self.object_pub = self.create_publisher(PointCloud2, '/gnn_objects_pc', 10)
+        # self.object_pub = self.create_publisher(PointCloud2, '/gnn_objects_pc', 10)
+        self.tracked_polygon_pub = self.create_publisher(TrackedPolygon, "/tracked_polygons", 10)
+
 
         self.tracked_objects = defaultdict(list)
         self.max_robot_lifetime = 3.0  # seconds
@@ -64,9 +75,35 @@ class GNNInferenceNode(Node):
         self.tracker_id_counter = 0
         self.max_tracker_age = 1.0  # seconds
 
+        self.declare_parameter('run_id', 'default_run')
+        self.run_id = self.get_parameter('run_id').get_parameter_value().string_value
+        self.get_logger().info(f'run_id: {self.run_id}')
+        timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        log_dir = f'datalogging/inference/{self.run_id}_{timestamp}'
+        os.makedirs(log_dir, exist_ok=True)
+        self.log_path = os.path.join(log_dir, 'gnn_inference_log.csv')
+        # CSV header
+        if not os.path.exists(self.log_path):
+            with open(self.log_path, mode='w', newline='') as f:
+                writer = csv.writer(f)
+                writer.writerow([
+                    "timestamp_ros", "run_id", "graph_timestamp",
+                    "inference_latency_ms", 
+                    # "node_count", "edge_count",
+                    # "pred_class_distribution", "edge_pred_pos_ratio",
+                    "cluster_count", "object_class_distribution",
+                    "mean_confidence", "new_objects", "removed_objects",
+                    "gnn_pipeline_latency_ms",
+                    "shared_objects_perc"
+                ])
+
         self.get_logger().info("🧠 GNN Inference Node ready.")
 
     def graph_callback(self, msg: GraphData):
+        #start_time = time.time()
+        self.last_graph_timestamp = msg.header.stamp.sec + 1e-9 * msg.header.stamp.nanosec
+        self.graph_receive_time = time.time()
+
         try:
             N, D = msg.num_nodes, msg.node_feature_dim
             E, D_e = msg.num_edges, msg.edge_attr_dim
@@ -75,7 +112,9 @@ class GNNInferenceNode(Node):
             edge_attr = np.array(msg.edge_attr, dtype=np.float32).reshape((E, D_e))
             # Replace this with your actual GNN model inference
             pred_class, pred_edge_class, pred_class_conf = self.run_inference(node_feats, edge_index, edge_attr)
+            self.inference_time_ms = (time.time() - self.graph_receive_time) * 1000
         except Exception as e:
+            self.inference_time_ms = 20.0
             self.get_logger().error(f"❌ Failed inference: {e}")
 
         self.use_graph_clusters = True
@@ -83,6 +122,7 @@ class GNNInferenceNode(Node):
             self.process_predictions(node_feats, edge_index, pred_class, pred_edge_class, pred_class_conf)
         else:
             self.process_predictions_v2(node_feats, pred_class)
+
 
     def run_inference(self, node_feats, edge_index, edge_attr):
         # Placeholder dummy inference: 4-class logits per node
@@ -104,7 +144,7 @@ class GNNInferenceNode(Node):
 
        # Probability that edge is \"connected\"\n",
         edge_connected_prob = torch.sigmoid(edge_cls_predictions[:, 1])
-        threshold = 0.88  # You can tune this later for best F1\n",
+        threshold = 0.91  # You can tune this later for best F1\n",
         pred_edge_class = (edge_connected_prob >= threshold).long()
 
         pred_class = cls_idx.detach().cpu().numpy()
@@ -126,7 +166,7 @@ class GNNInferenceNode(Node):
         return (*color, 1.0)  # RGBA
     
     def create_pointcloud2(self, points, frame_id="map"):
-        header = Header()
+        header = std_msgs.msg.Header()
         header.stamp = self.get_clock().now().to_msg()
         header.frame_id = frame_id
 
@@ -139,16 +179,26 @@ class GNNInferenceNode(Node):
         return pc2.create_cloud(header, fields, points)
     
     def process_predictions(self, node_feats, edge_index, pred_class, pred_edge_class, conf_scores):
-        # flips the points back to ROS
-        # 🔁 Revert the manual radar remapping
-        #node_feats[:, 0], node_feats[:, 1] = -node_feats[:, 1], -node_feats[:, 0]
-
 
         G = nx.Graph()
+        MAX_EDGE_DIST = 1.2  # meters — tune as needed
+
         for i in range(edge_index.shape[1]):
             src, tgt = edge_index[0, i], edge_index[1, i]
-            if pred_edge_class[i] == 1 and pred_class[src] == pred_class[tgt]:
+
+            if pred_class[src] != pred_class[tgt]:
+                continue  # Must be same class
+
+            if pred_edge_class[i] != 1:
+                continue  # Only consider confident edges
+
+            src_pt = node_feats[src][:2]
+            tgt_pt = node_feats[tgt][:2]
+            dist = np.linalg.norm(src_pt - tgt_pt)
+
+            if dist < MAX_EDGE_DIST:
                 G.add_edge(src, tgt)
+
 
         current_time = self.get_clock().now().nanoseconds / 1e9
         clusters = list(nx.connected_components(G))
@@ -159,22 +209,49 @@ class GNNInferenceNode(Node):
             cls = pred_class[list(cluster)[0]]
             conf = np.mean([conf_scores[i] for i in cluster])
 
-            if cls == 0 or conf < 0.7:
+            # if cls == 0 or conf < 0.7:
+            
+            if cls == 0:
                 continue
-            if len(points) < 4 or np.linalg.matrix_rank(points - points[0]) < 2:
+            # if len(points) < 8 or np.linalg.matrix_rank(points - points[0]) < 2:
+            if len(points) < 6 or np.linalg.matrix_rank(points - points[0]) < 2:
                 continue
-
             try:
-                hull = ConvexHull(points)
-                hull_pts = points[hull.vertices]
+                alpha = 0.01  # Tune per data — lower is tighter  (make it adaptive base don class later on)
+                shape = alphashape.alphashape(points, alpha)
+                
+                # Skip non-polygon results (e.g., single point/line)
+                if not isinstance(shape, Polygon):
+                    continue
+
+                hull_pts = np.array(shape.exterior.coords)  # Boundary points
                 centroid = np.mean(points, axis=0)
-                new_detections[cls].append((centroid, hull_pts, conf))
+
+                # --- Robot contribution tracking ---
+                robot_ids = [int(node_feats[i][-1]) for i in cluster]
+                robot_counts = Counter(robot_ids)
+                total = sum(robot_counts.values())
+                contrib_ratios = {rid: count / total for rid, count in robot_counts.items()}
+
+                # --- Store full detection record including contribution ratios ---
+                new_detections[cls].append({
+                    'centroid': centroid,
+                    'shape': hull_pts,
+                    'confidence': conf,
+                    'contrib_ratios': contrib_ratios
+                })
             except Exception as e:
-                self.get_logger().warn(f"Could not compute hull for cluster (class {cls}): {e}")
+                self.get_logger().warn(f"Alpha shape failed for cluster (class {cls}): {e}")
+
+
 
         for cls, detections in new_detections.items():
             updated_ids = set()
-            for centroid, shape, conf in detections:
+            for det in detections:
+                centroid = det['centroid']
+                shape = det['shape']
+                conf = det['confidence']
+                contrib_ratios = det['contrib_ratios']
                 best_tracker = None
                 best_dist = float('inf')
 
@@ -189,11 +266,15 @@ class GNNInferenceNode(Node):
                     best_tracker.update(centroid,current_time)
                     best_tracker.last_seen = current_time
                     best_tracker.shape = shape
+                    best_tracker.contrib_ratios = contrib_ratios 
+                    best_tracker.conf = conf
                     updated_ids.add(id(best_tracker))
                 else:
                     tracker = ObjectTracker(initial_pos=centroid)
                     tracker.shape = shape
                     tracker.last_seen = current_time
+                    tracker.contrib_ratios = contrib_ratios  # ✅ ADD THIS
+                    tracker.conf = conf
                     self.trackers_per_class[cls].append(tracker)
 
             self.trackers_per_class[cls] = [
@@ -207,9 +288,69 @@ class GNNInferenceNode(Node):
                     'timestamp': current_time,
                     'centroid': tracker.get_state(),
                     'shape': tracker.shape,
-                    'confidence': 1.0
+                    'confidence': tracker.conf,
+                    'contrib_ratios': getattr(tracker, 'contrib_ratios', {})  # fallback empty
                 })
-        self.publish_tracked_objects_as_pointcloud()
+        #self.publish_tracked_objects_as_pointcloud()
+        #self.publish_tracked_objects_as_polygons(current_time)
+        self.publish_tracked_polygons_v1(current_time)
+
+        object_classes = []
+        object_confidences = []
+        object_ids = []
+
+        # init before use
+        shared_count = 0
+
+        for cls, objs in self.tracked_objects.items():
+            for obj in objs:
+                object_classes.append(cls)
+                object_confidences.append(obj.get("confidence", 1.0))
+                object_ids.append(id(obj))  # or use a real ID if available
+                r = obj.get("contrib_ratios", {})
+                if len(r) > 1:
+                    shared_count += 1
+
+        now = time.time()
+        # Latency
+        end_to_end_latency = (now - self.last_graph_timestamp) * 1000
+        graph_network_latency = (self.graph_receive_time - self.last_graph_timestamp) * 1000
+        # shared_ratio = shared_count / cluster_count if cluster_count > 0 else 0.0
+        # # Cluster + confidence
+        # cluster_count = len(self.tracked_objects)
+        #object_classes = [o.label for o in self.tracked_objects]
+        #object_confidences = [o.conf for o in self.tracked_objects]
+        cluster_count = sum(len(v) for v in self.tracked_objects.values())
+        shared_ratio = shared_count / cluster_count if cluster_count > 0 else 0.0
+        object_class_dist_clean = {int(k): int(v) for k, v in dict(Counter(object_classes)).items()}
+        mean_conf = float(np.mean(object_confidences)) if object_confidences else 0.0
+
+        # ID tracking
+        current_ids = set(object_ids)
+        new_ids = current_ids - getattr(self, "prev_ids", set())
+        removed_ids = getattr(self, "prev_ids", set()) - current_ids
+        self.prev_ids = current_ids
+
+        # Node-level stats (store these in graph_callback)
+        # node_count = self.node_count
+        # edge_count = self.edge_count
+        # pred_class_dist = self.pred_class_distribution
+        # edge_pos_ratio = self.edge_pos_ratio
+
+        # Log all
+        with open(self.log_path, mode='a', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                now, self.run_id, self.last_graph_timestamp,
+                round(self.inference_time_ms, 2), 
+                # node_count, edge_count,
+                # str(pred_class_dist), round(edge_pos_ratio, 3),
+                cluster_count, str(object_class_dist_clean),
+                round(mean_conf, 3), len(new_ids), len(removed_ids),
+                round(end_to_end_latency, 2),
+                round(shared_ratio, 3)  # ✅ NEW FIELD
+            ])
+
 
         # RViz Visualization
         marker_array = MarkerArray()
@@ -232,13 +373,10 @@ class GNNInferenceNode(Node):
                 marker_array.markers.append(marker)
 
         self.marker_pub.publish(marker_array)
+        
+
 
     def publish_tracked_objects_as_pointcloud(self):
-        import numpy as np
-        from sensor_msgs.msg import PointField
-        from sensor_msgs_py.point_cloud2 import create_cloud
-        import std_msgs.msg
-
         fields = [
             PointField(name='x', offset=0, datatype=PointField.FLOAT32, count=1),
             PointField(name='y', offset=4, datatype=PointField.FLOAT32, count=1),
@@ -276,6 +414,50 @@ class GNNInferenceNode(Node):
         self.object_pub.publish(cloud_msg)
 
 
+
+    def publish_tracked_polygons(self, current_time):
+        for cls, trackers in self.trackers_per_class.items():
+            for tracker in trackers:
+                shape = tracker.shape
+                conf = tracker.confidence  # Fixed for now, or you can store in tracker
+                # if shape is None or len(shape) < 3:
+                if shape is None:
+                    continue
+
+                msg = TrackedPolygon()
+                msg.header.frame_id = "map"
+                msg.header.stamp = self.get_clock().now().to_msg()
+                msg.label = int(cls)
+                msg.confidence = float(conf)
+                msg.polygon.points = [Point32(x=float(x), y=float(y), z=0.0) for x, y in shape]
+
+                self.tracked_polygon_pub.publish(msg)
+
+
+    def publish_tracked_polygons_v1(self, current_time):
+        for cls, trackers in self.tracked_objects.items():
+            for tracker in trackers:
+                shape = tracker['shape']
+                conf = tracker['confidence']
+                if shape is None:
+                    continue
+
+                msg = TrackedPolygon()
+                msg.header.frame_id = "map"
+                msg.header.stamp = self.get_clock().now().to_msg()
+                msg.label = int(cls)
+                msg.confidence = float(conf)
+                msg.polygon.points = [Point32(x=float(x), y=float(y), z=0.0) for x, y in shape]
+
+                # 💡 Add contributor info
+                contrib_ratios = tracker.get('contrib_ratios', {})
+                msg.contributor_ids = list(contrib_ratios.keys())
+                msg.contributor_ratios = [float(r) for r in contrib_ratios.values()]
+
+                self.tracked_polygon_pub.publish(msg)
+
+
+
     def process_predictions_v2(self, node_feats, pred_class, merge_dist=0.5):
         """
         Alternate prediction processor using DBSCAN clustering and convex hulls.
@@ -306,7 +488,7 @@ class GNNInferenceNode(Node):
             if len(points) < 3:
                 continue
 
-            db = DBSCAN(eps=merge_dist, min_samples=4).fit(points)
+            db = DBSCAN(eps=merge_dist, min_samples=5).fit(points)
             cluster_labels = db.labels_
 
             for cluster_id in set(cluster_labels):
@@ -315,7 +497,7 @@ class GNNInferenceNode(Node):
 
                 cluster_pts = points[cluster_labels == cluster_id]
 
-                if len(cluster_pts) < 3:
+                if len(cluster_pts) < 5:
                     continue
 
                 try:

@@ -1,5 +1,5 @@
 # gnn_object_segmentation/msg/GraphData.msg
-
+std_msgs/Header header
 # Tensor-like flat arrays with size metadata
 float32[] node_features       # flattened [N x 10]
 uint32 node_feature_dim       # always 10

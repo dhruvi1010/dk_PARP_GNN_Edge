@@ -1,0 +1,13 @@
+{
+    "cmake.sourceDirectory": "/home/flw-6gem-dev/dev/ROS_GNN_ws/src/gnn_interfaces",
+    "files.associations": {
+        "deque": "cpp",
+        "vector": "cpp",
+        "forward_list": "cpp",
+        "list": "cpp",
+        "string": "cpp",
+        "unordered_map": "cpp",
+        "unordered_set": "cpp",
+        "system_error": "cpp"
+    }
+}
