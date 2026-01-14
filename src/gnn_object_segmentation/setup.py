@@ -31,6 +31,7 @@ setup(
         'console_scripts': [
             'gnn_fusion_inference_node = gnn_object_segmentation.gnn_fusion_inference_node:main',
             'data_merge = gnn_object_segmentation.data_merge:main',
+            'data_merge_dynamic = gnn_object_segmentation.data_merge_dynamic:main',
             'arena_marker_node = gnn_object_segmentation.arena_boundary_publisher:main',
             'tracked_polygon_visualizer = gnn_object_segmentation.tracked_polygon_visualizer:main',
             'waypoint_publisher = gnn_object_segmentation.waypoint_publisher:main',
