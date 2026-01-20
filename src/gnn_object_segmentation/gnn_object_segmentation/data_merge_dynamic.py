@@ -58,19 +58,32 @@ class DataMergerNodeDynamic(Node):
         ##self.declare_parameter("robot_list", ["rm04", "rm03"]) 
         ##self.robot_names = self.get_parameter("robot_list").get_parameter_value().string_array_value
 
-        ####
-        # --- Dynamic Configuration ---
-        # We declare it as a string because Launch files pass lists as JSON strings
-        self.declare_parameter("robot_list", '["rm04", "rm03"]') 
+        # ####
+        # # --- Dynamic Configuration ---
+        # # We declare it as a string because Launch files pass lists as JSON strings
+        # self.declare_parameter("robot_list", '["rm04", "rm03"]') 
         
-        param_str = self.get_parameter("robot_list").get_parameter_value().string_value
-        try:
-            # Parse the string '["rm04", "rm03"]' into a real Python list
-            self.robot_names = json.loads(param_str)
-        except json.JSONDecodeError:
-            self.get_logger().error(f"Failed to parse robot_list: {param_str}. Fallback to default.")
+        # param_str = self.get_parameter("robot_list").get_parameter_value().string_value
+        # try:
+        #     # Parse the string '["rm04", "rm03"]' into a real Python list
+        #     self.robot_names = json.loads(param_str)
+        # except json.JSONDecodeError:
+        #     self.get_logger().error(f"Failed to parse robot_list: {param_str}. Fallback to default.")
+        #     self.robot_names = ["rm04", "rm03"]
+        # #####
+
+        # --- Dynamic Configuration ---
+        # Declare as a list of strings (STRING_ARRAY) natively
+        # Note the default value is a real list ["rm04", "rm03"], not a string '["..."]'
+        self.declare_parameter("robot_list", ["rm04", "rm03"]) 
+        
+        # Retrieve directly as a string array
+        self.robot_names = self.get_parameter("robot_list").get_parameter_value().string_array_value
+        
+        # Safety check: if for some reason it's empty, fallback
+        if not self.robot_names:
+            self.get_logger().warn("Received empty robot_list. Falling back to default.")
             self.robot_names = ["rm04", "rm03"]
-        #####
 
         # Map robot names to numeric IDs (1, 2, 3...) based on their order in the list
         # IMPORTANT: The GNN .pt model might expect specific IDs (e.g. 1 and 2). 
@@ -80,7 +93,9 @@ class DataMergerNodeDynamic(Node):
         self.get_logger().info(f"Initialized Dynamic Merger with robots: {self.robot_names}")
         self.get_logger().info(f"ID Mapping: {self.robot_id_map}")
 
-        self.clock = Clock()
+        #self.clock = Clock()
+        self.clock = self.get_clock() # (Uses ROS Sim Time)
+
 
         # Dynamic Buffers
         self.pose_buffer = {name: deque(maxlen=1000) for name in self.robot_names}
@@ -449,11 +464,21 @@ class DataMergerNodeDynamic(Node):
                     ] + vicon_delays
                     writer.writerow(row)
 
+        # # Cleanup
+        # max_buffer_age = 1.5
+        # for name in self.robot_names:
+        #     self.prune_buffer(self.radar_buffer[name], max_buffer_age, now)
+        #     self.prune_buffer(self.pose_buffer[name], max_buffer_age, now)
+        
+        # self.merged_data_buffer = [f for f in self.merged_data_buffer if now - f['timestamp'] < max_buffer_age]
+
         # Cleanup
         max_buffer_age = 1.5
-        for name in self.robot_names:
-            self.prune_buffer(self.radar_buffer[name], max_buffer_age, now)
-            self.prune_buffer(self.pose_buffer[name], max_buffer_age, now)
+        
+        # FIX: Pass the WHOLE dictionary. Do NOT loop through names here.
+        # The prune_buffer function already contains a loop to handle all keys.
+        self.prune_buffer(self.radar_buffer, max_buffer_age, now)
+        self.prune_buffer(self.pose_buffer, max_buffer_age, now)
         
         self.merged_data_buffer = [f for f in self.merged_data_buffer if now - f['timestamp'] < max_buffer_age]
 
