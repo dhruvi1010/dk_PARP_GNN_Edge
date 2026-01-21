@@ -34,7 +34,7 @@ setup(
             'data_merge_dynamic = gnn_object_segmentation.data_merge_dynamic:main',
             'arena_marker_node = gnn_object_segmentation.arena_boundary_publisher:main',
             'tracked_polygon_visualizer = gnn_object_segmentation.tracked_polygon_visualizer:main',
-            'waypoint_publisher = gnn_object_segmentation.waypoint_publisher:main',
+            'waypoint_publisher = gnn_object_segmentation.waypoints_publisher:main',
             # Add more nodes here as needed
         ],
     },
