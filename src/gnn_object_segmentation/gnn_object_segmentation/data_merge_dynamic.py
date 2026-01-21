@@ -377,6 +377,121 @@ class DataMergerNodeDynamic(Node):
         for key in buffer_dict:
             buffer_dict[key] = [(t, data) for (t, data) in buffer_dict[key] if now - t < max_age]
 
+
+    def sync_and_merge(self):
+        merge_start_time = time.perf_counter()
+        
+        # DEBUG 1: Check Buffers
+        # Create a quick summary of buffer sizes
+        buffer_sizes = {name: len(self.radar_buffer[name]) for name in self.robot_names}
+        
+        # Check if ANY robot has data
+        has_data = any(size > 0 for size in buffer_sizes.values())
+        if not has_data:
+            # Only print this once every 5 seconds to avoid spamming if truly empty
+            throttle_period = 5.0 
+            now_sec = self.clock.now().nanoseconds * 1e-9
+            if not hasattr(self, 'last_no_data_log') or (now_sec - self.last_no_data_log > throttle_period):
+                self.get_logger().warn(f"Waiting for data... Buffers: {buffer_sizes}")
+                self.last_no_data_log = now_sec
+            return
+
+        now = self.clock.now().nanoseconds * 1e-9
+        fresh_threshold = 0.75 
+
+        # Determine reference timestamp (latest from any robot)
+        latest_timestamps = [
+            (self.radar_buffer[name][-1][0] if self.radar_buffer[name] else 0) 
+            for name in self.robot_names
+        ]
+        
+        # DEBUG 2: Check Time Freshness
+        # If all data is old, skip
+        if all((now - ts > fresh_threshold) for ts in latest_timestamps if ts > 0):
+            # Calculate how old the data is
+            age = max([now - ts for ts in latest_timestamps if ts > 0], default=0)
+            self.get_logger().warn(f"Data too old! Age: {age:.2f}s (Threshold: {fresh_threshold}s). Ignoring.")
+            return
+
+        # Pick the latest available timestamp as reference
+        ref_timestamp = max(latest_timestamps)
+        
+        merged_data = {'timestamp': ref_timestamp, 'poses': {}, 'radar_points': {}}
+        points_counts = []
+
+        # Iterate all robots and sync
+        for name in self.robot_names:
+            radar_match = self.get_closest(self.radar_buffer[name], ref_timestamp)
+            if radar_match:
+                # DEBUG 3: Inside process_radar_points, there is a try/except for TF.
+                # If that fails, it returns empty lists.
+                gnn_pts, viz_pts = self.process_radar_points(
+                    radar_match[1], name, radar_match[0], self.robot_id_map[name]
+                )
+                
+                # Statistical Outlier Removal
+                if len(gnn_pts) >= 15:
+                    pts_array = np.array([[pt['x'], pt['y'], pt['z']] for pt in gnn_pts])
+                    filtered = statistical_outlier_removal(pts_array, k=8, std_ratio=1.0)
+                    filtered_set = set(map(tuple, filtered))
+                    gnn_pts = [pt for pt in gnn_pts if (pt['x'], pt['y'], pt['z']) in filtered_set]
+
+                merged_data['radar_points'][name] = gnn_pts
+                points_counts.append(len(gnn_pts))
+            else:
+                points_counts.append(0)
+
+        # --- THIS IS THE MISSING LOG FROM THE ORIGINAL SCRIPT ---
+        # It prints how many points were actually merged for each robot
+        points_summary = dict(zip(self.robot_names, points_counts))
+        self.get_logger().info(f"[SYNC] Points merged: {points_summary}")
+
+        # Skip if totally empty
+        if sum(points_counts) == 0:
+            self.get_logger().warn("[SYNC] Zero points merged after processing (TF lookup failed?)")
+            return
+
+        self.merged_data_buffer.append(merged_data)
+        
+        # Build Graph
+        graph_start_time = time.time()
+        window_frames = self.get_recent_window_frames(merged_data['timestamp'])
+        graph_data = self.build_graph_from_window(window_frames, self.norm_weights)
+        graph_end_time = time.time()
+
+        if graph_data:
+            node_feats, edge_index, edge_attr = graph_data
+            if edge_attr.shape[0] > 0 and edge_index.shape[1] > 0:
+                self.publish_graph(node_feats, edge_index, edge_attr)
+                
+                # Log stats
+                inter_robot_edges = int(np.sum([
+                    1 for i, j in edge_index.T if node_feats[i, -1] != node_feats[j, -1]
+                ]))
+                
+                # Calculate delays dynamically
+                vicon_delays = []
+                for name in self.robot_names:
+                    last_ts = self.last_vicon_timestamp[name]
+                    vicon_delays.append(round((now - last_ts) * 1000, 2) if last_ts > 0 else 0.0)
+
+                with open(self.csv_path, mode='a', newline='') as file:
+                    writer = csv.writer(file)
+                    row = [now, self.run_id, self.N] + points_counts + [
+                        node_feats.shape[0], edge_index.shape[1], inter_robot_edges,
+                        round((graph_end_time - graph_start_time) * 1000, 2),
+                        (time.perf_counter() - merge_start_time) * 1000
+                    ] + vicon_delays
+                    writer.writerow(row)
+
+        # Cleanup
+        max_buffer_age = 1.5
+        
+        self.prune_buffer(self.radar_buffer, max_buffer_age, now)
+        self.prune_buffer(self.pose_buffer, max_buffer_age, now)
+        
+        self.merged_data_buffer = [f for f in self.merged_data_buffer if now - f['timestamp'] < max_buffer_age]
+""" 
     def sync_and_merge(self):
         merge_start_time = time.perf_counter()
         
@@ -481,7 +596,7 @@ class DataMergerNodeDynamic(Node):
         self.prune_buffer(self.pose_buffer, max_buffer_age, now)
         
         self.merged_data_buffer = [f for f in self.merged_data_buffer if now - f['timestamp'] < max_buffer_age]
-
+ """
 def main(args=None):
     rclpy.init(args=args)
     parser = argparse.ArgumentParser()
