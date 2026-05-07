@@ -9,4 +9,6 @@ log/
 .ccls-cache/
 datalogging/
 
+# macOS
 .DS_Store
+
