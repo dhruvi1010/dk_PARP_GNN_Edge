@@ -8,3 +8,5 @@ log/
 *.png
 .ccls-cache/
 datalogging/
+
+.DS_Store
