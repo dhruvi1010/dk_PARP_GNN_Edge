@@ -1,11 +1,10 @@
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument
 from launch_ros.actions import Node
-from launch.substitutions import LaunchConfiguration, PathJoinSubstitution, TextSubstitution, PythonExpression
-from launch.conditions import IfCondition, UnlessCondition
+from launch.substitutions import LaunchConfiguration, PathJoinSubstitution, TextSubstitution
+from launch.conditions import IfCondition
 from launch.actions import ExecuteProcess
 import datetime
-import os
 
 
 def generate_launch_description():
@@ -18,6 +17,7 @@ def generate_launch_description():
         run_id,
         TextSubstitution(text=f'_{timestamp}_bag')
     ])
+
     return LaunchDescription([
         # --- Launch Arguments ---
         DeclareLaunchArgument(
@@ -31,6 +31,11 @@ def generate_launch_description():
             description='Use simulation mode (affects transform handling)'
         ),
         DeclareLaunchArgument(
+            'use_sim_time',
+            default_value='False',
+            description='Use simulation (clock) time if True'
+        ),
+        DeclareLaunchArgument(
             'rviz_config',
             default_value='src/gnn_object_segmentation/rviz/flw_hall_gnn.rviz',
             description='Path to RViz config file'
@@ -40,38 +45,56 @@ def generate_launch_description():
             default_value='default_run',
             description='Run ID for log correlation'
         ),
+        # --- Updated Default Robot List ---
+        DeclareLaunchArgument(
+            'robot_list',
+            default_value='["rm03", "rm04", "rm05", "cr01"]',
+            description='List of robot namespaces passed as a JSON string'
+        ),
 
-        # --- rosbag record 🟢 ---
+        # --- rosbag record ---
         ExecuteProcess(
             cmd=[
                 'ros2', 'bag', 'record', '-o', bag_dir,
                 'clock',
-                '/rm03/ti_mmwave/radar_scan_pcl', '/rm04/ti_mmwave/radar_scan_pcl',
                 '/tf', '/tf_static', 
-                'rm03/odom','rm04/odom',
-                '/rm03/vicon_pose','/rm04/vicon_pose',
-                '/tracked_polygons', 'gnn_objetcs',
-                '/rm03/global_costmap/costmap_raw','/rm04/global_costmap/costmap_raw',
+                '/tracked_polygons', 'gnn_objects',
                 '/graph_data', 
                 '/navigate_to_pose/feedback', '/navigate_to_pose/result',
-                '/rm03/plan', '/rm04/plan', 
-                '/rm03/path', '/rm04/path', 
-                '/rm03/cmd_vel','/rm04/cmd_vel', 
-                '/rm03/behavior_tree_log', '/rm04/behavior_tree_log',
-                '/tracked_polygons','gnn_objects'
-                # '--qos-profile-overrides-path', 'src/gnn_object_segmentation/qos_overrides.yaml'
+                
+                # --- rm03 topics ---
+                '/rm03/ti_mmwave/radar_scan_pcl', 'rm03/odom', '/rm03/vicon_pose',
+                '/rm03/global_costmap/costmap_raw', '/rm03/plan', '/rm03/path', 
+                '/rm03/cmd_vel', '/rm03/behavior_tree_log',
+                
+                # --- rm04 topics ---
+                '/rm04/ti_mmwave/radar_scan_pcl', 'rm04/odom', '/rm04/vicon_pose',
+                '/rm04/global_costmap/costmap_raw', '/rm04/plan', '/rm04/path', 
+                '/rm04/cmd_vel', '/rm04/behavior_tree_log',
+
+                # --- rm05 topics ---
+                '/rm05/ti_mmwave/radar_scan_pcl', 'rm05/odom', '/rm05/vicon_pose',
+                '/rm05/global_costmap/costmap_raw', '/rm05/plan', '/rm05/path', 
+                '/rm05/cmd_vel', '/rm05/behavior_tree_log',
+
+                # --- cr01 topics ---
+                '/cr01/ti_mmwave/radar_scan_pcl', 'cr01/odom', '/cr01/vicon_pose',
+                '/cr01/global_costmap/costmap_raw', '/cr01/plan', '/cr01/path', 
+                '/cr01/cmd_vel', '/cr01/behavior_tree_log'
             ],
             output='screen'
         ),
 
-        # --- Data Merger Node ---
+        # --- Dynamic Data Merger Node ---
         Node(
             package='gnn_object_segmentation',
-            executable='data_merge',
+            executable='data_merge_dynamic', 
             name='data_merge',
             parameters=[
                 {"run_id": LaunchConfiguration('run_id')},
-                {"window_size": 5}
+                {"window_size": 5},
+                {"robot_list": LaunchConfiguration('robot_list')},
+                {"use_sim_time": LaunchConfiguration('use_sim_time')}
             ],
             output='screen',
             arguments=[
@@ -88,28 +111,28 @@ def generate_launch_description():
             output='screen',
             parameters=[{
                 'input_topic': '/tracked_polygons',
-                'output_topic': '/tracked_polygon_markers'
+                'output_topic': '/tracked_polygon_markers',
+                'use_sim_time': LaunchConfiguration('use_sim_time')
             }]
         ),
 
-        # --- Arena Static Markers (for testing or mapping) ---
-        # Node(
-        #     package='gnn_object_segmentation',
-        #     executable='arena_marker_node',
-        #     name='arena_marker_node',
-        #     output='screen',
-        #     condition=IfCondition(LaunchConfiguration('visualize'))
-        # ),
-
-        # --- RViz2 (Visualization) ---
+        # --- Optional RViz2 and Arena Markers (Commented out by default) ---
         # Node(
         #     package='rviz2',
         #     executable='rviz2',
         #     name='rviz2',
         #     output='screen',
         #     arguments=['-d', LaunchConfiguration('rviz_config')],
+        #     parameters=[{'use_sim_time': LaunchConfiguration('use_sim_time')}],
         #     condition=IfCondition(LaunchConfiguration('visualize'))
         # ),
 
-
+        # Node(
+        #     package='gnn_object_segmentation',
+        #     executable='arena_marker_node',
+        #     name='arena_marker_node',
+        #     output='screen',
+        #     parameters=[{'use_sim_time': LaunchConfiguration('use_sim_time')}],
+        #     condition=IfCondition(LaunchConfiguration('visualize'))
+        # ),
     ])
