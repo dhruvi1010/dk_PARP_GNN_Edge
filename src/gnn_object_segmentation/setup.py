@@ -25,12 +25,14 @@ setup(
         ('share/' + package_name + '/launch', ['launch/multi_robot_inference_wo_rosbag.launch.py']),    
         ('share/' + package_name + '/rviz', ['rviz/flw_hall.rviz']),
         ('share/' + package_name + '/config', ['config/waypoints.yaml']),
+        ('share/' + package_name + '/config', ['config/waypoints_rm05.yaml']),
         #('share/' + package_name + '/config', ['config/normalization_weights_unified.pkl']),
     ],
     entry_points={
         'console_scripts': [
             'gnn_fusion_inference_node = gnn_object_segmentation.gnn_fusion_inference_node:main',
             'data_merge = gnn_object_segmentation.data_merge:main',
+            'data_merge_dynamic = gnn_object_segmentation.data_merge_dynamic:main',
             'arena_marker_node = gnn_object_segmentation.arena_boundary_publisher:main',
             'tracked_polygon_visualizer = gnn_object_segmentation.tracked_polygon_visualizer:main',
             'waypoints_publisher = gnn_object_segmentation.waypoints_publisher:main',

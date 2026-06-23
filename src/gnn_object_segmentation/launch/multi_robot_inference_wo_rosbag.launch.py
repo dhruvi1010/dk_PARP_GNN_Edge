@@ -1,108 +1,109 @@
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, ExecuteProcess
+from launch.actions import DeclareLaunchArgument
 from launch_ros.actions import Node
-from launch.substitutions import LaunchConfiguration, PythonExpression
+from launch.substitutions import LaunchConfiguration, PathJoinSubstitution, TextSubstitution
 from launch.conditions import IfCondition
+from launch.actions import ExecuteProcess
+import datetime
 
 
 def generate_launch_description():
+    # Generate timestamp at launch time
+    run_id = LaunchConfiguration('run_id')
+    timestamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+
+    bag_dir = PathJoinSubstitution([
+        TextSubstitution(text='datalogging/rosbags/'),
+        run_id,
+        TextSubstitution(text=f'_{timestamp}_bag')
+    ])
+
     return LaunchDescription([
         # --- Launch Arguments ---
-        DeclareLaunchArgument(
-            'ep03_bag',
-            default_value='/home/asfy/flw/Robo_FUSE_Dataset/CPPS_Vertical/Robot_1/rosbag/20250219_171846/20250219_171846_0.db3',
-            #default_value='/home/flw-6gem-dev/dev/RoboFUSE_Dataset/CPPS_Static_Scenario/CPPS_Horizontal/Robot_1/rosbag_logs/20250221_120046_v2/20250221_120046_0.db3',
-            description='Rosbag path for ep03 (Robot 1)'
-        ),
-        DeclareLaunchArgument(
-            'ep05_bag',
-            default_value='/home/asfy/flw/Robo_FUSE_Dataset/CPPS_Vertical/Robot_2/rosbag/20250219_171851/20250219_171851_0.db3',
-            #default_value='/home/flw-6gem-dev/dev/RoboFUSE_Dataset/CPPS_Static_Scenario/CPPS_Horizontal/Robot_2/rosbag_logs/20250221_120054_v2/20250221_120054_0.db3',
-            description='Rosbag path for ep05 (Robot 2)'
-        ),
         DeclareLaunchArgument(
             'visualize',
             default_value='False',
             description='Enable RViz2 radar and robot position visualization'
         ),
         DeclareLaunchArgument(
-            'use_rosbags',
-            default_value='False',
-            description='Play rosbag files if true, else assume live data'
-        ),
-        DeclareLaunchArgument(
             'simulation',
             default_value='False',
-            description='Play rosbag files if true, else assume live data'
+            description='Use simulation mode (affects transform handling)'
+        ),
+        DeclareLaunchArgument(
+            'use_sim_time',
+            default_value='False',
+            description='Use simulation (clock) time if True'
         ),
         DeclareLaunchArgument(
             'rviz_config',
             default_value='src/gnn_object_segmentation/rviz/flw_hall_gnn.rviz',
             description='Path to RViz config file'
         ),
+        DeclareLaunchArgument(
+            'run_id',
+            default_value='default_run',
+            description='Run ID for log correlation'
+        ),
+        # --- Updated Default Robot List ---
+        DeclareLaunchArgument(
+            'robot_list',
+            default_value='["rm03", "rm04", "rm05", "cr01"]',
+            description='List of robot namespaces passed as a JSON string'
+        ),
 
-        # --- Rosbag Playback (conditionally launched) ---
+        # --- rosbag record ---
         ExecuteProcess(
-            cmd=['ros2', 'bag', 'play', LaunchConfiguration('ep03_bag'), '--rate', '1.0', '--clock'],
-            condition=IfCondition(LaunchConfiguration('use_rosbags')),
+            cmd=[
+                'ros2', 'bag', 'record', '-o', bag_dir,
+                'clock',
+                '/tf', '/tf_static', 
+                '/tracked_polygons', 'gnn_objects',
+                '/graph_data', 
+                '/navigate_to_pose/feedback', '/navigate_to_pose/result',
+                
+                # --- rm03 topics ---
+                '/rm03/ti_mmwave/radar_scan_pcl', 'rm03/odom', '/rm03/vicon_pose',
+                '/rm03/global_costmap/costmap_raw', '/rm03/plan', '/rm03/path', 
+                '/rm03/cmd_vel', '/rm03/behavior_tree_log',
+                
+                # --- rm04 topics ---
+                '/rm04/ti_mmwave/radar_scan_pcl', 'rm04/odom', '/rm04/vicon_pose',
+                '/rm04/global_costmap/costmap_raw', '/rm04/plan', '/rm04/path', 
+                '/rm04/cmd_vel', '/rm04/behavior_tree_log',
+
+                # --- rm05 topics ---
+                '/rm05/ti_mmwave/radar_scan_pcl', 'rm05/odom', '/rm05/vicon_pose',
+                '/rm05/global_costmap/costmap_raw', '/rm05/plan', '/rm05/path', 
+                '/rm05/cmd_vel', '/rm05/behavior_tree_log',
+
+                # --- cr01 topics ---
+                '/cr01/ti_mmwave/radar_scan_pcl', 'cr01/odom', '/cr01/vicon_pose',
+                '/cr01/global_costmap/costmap_raw', '/cr01/plan', '/cr01/path', 
+                '/cr01/cmd_vel', '/cr01/behavior_tree_log'
+            ],
             output='screen'
         ),
-        ExecuteProcess(
-            cmd=['ros2', 'bag', 'play', LaunchConfiguration('ep05_bag'), '--rate', '1.0', '--clock'],
-            condition=IfCondition(LaunchConfiguration('use_rosbags')),
-            output='screen'
-        ),
 
-        # --- Data Merger Node (with or without visualization) ---
+        # --- Dynamic Data Merger Node ---
         Node(
             package='gnn_object_segmentation',
-            executable='data_merge',
+            executable='data_merge_dynamic', 
             name='data_merge',
             parameters=[
-                {"run_id": "default_run"},
-                {"window_size": 5}
+                {"run_id": LaunchConfiguration('run_id')},
+                {"window_size": 5},
+                {"robot_list": LaunchConfiguration('robot_list')},
+                {"use_sim_time": LaunchConfiguration('use_sim_time')}
             ],
             output='screen',
             arguments=[
                 '--visualize', LaunchConfiguration('visualize'),
                 '--simulation', LaunchConfiguration('simulation')
-            ],
-            condition=IfCondition(LaunchConfiguration('visualize'))
-        ),
-        Node(
-            package='gnn_object_segmentation',
-            executable='data_merge',
-            name='data_merge',
-            parameters=[
-                {"run_id": "default_run"},
-                {"window_size": 5}
-            ],
-            output='screen',
-            arguments=[
-                '--visualize', LaunchConfiguration('visualize'),
-                '--simulation', LaunchConfiguration('simulation')
-            ],
-            condition=IfCondition(PythonExpression(['not ', LaunchConfiguration('visualize')]))
+            ]
         ),
 
-        # --- RViz2 (optional) ---
-        Node(
-            package='rviz2',
-            executable='rviz2',
-            name='rviz2',
-            output='screen',
-            arguments=['-d', LaunchConfiguration('rviz_config')],
-            condition=IfCondition(LaunchConfiguration('visualize'))
-        ),
-
-        Node(
-            package='gnn_object_segmentation',
-            executable='arena_marker_node',
-            name='arena_marker_node',
-            output='screen',
-            condition=IfCondition(LaunchConfiguration('visualize'))
-        ),
-
+        # --- Tracked Polygon Marker Publisher ---
         Node(
             package='gnn_object_segmentation',
             executable='tracked_polygon_visualizer',
@@ -110,23 +111,28 @@ def generate_launch_description():
             output='screen',
             parameters=[{
                 'input_topic': '/tracked_polygons',
-                'output_topic': '/tracked_polygon_markers'
+                'output_topic': '/tracked_polygon_markers',
+                'use_sim_time': LaunchConfiguration('use_sim_time')
             }]
         ),
 
-        # --- Octomap (optional) ---
+        # --- Optional RViz2 and Arena Markers (Commented out by default) ---
         # Node(
-        #     package='octomap_server',
-        #     executable='octomap_server_node',
-        #     name='octomap_server',
+        #     package='rviz2',
+        #     executable='rviz2',
+        #     name='rviz2',
         #     output='screen',
-        #     parameters=[{
-        #         'frame_id': 'map',
-        #         'resolution': 0.1,
-        #         'sensor_model_max_range': 10.0,
-        #     }],
-        #     remappings=[
-        #         ('cloud_in', '/octomap_input_points')
-        #     ]
+        #     arguments=['-d', LaunchConfiguration('rviz_config')],
+        #     parameters=[{'use_sim_time': LaunchConfiguration('use_sim_time')}],
+        #     condition=IfCondition(LaunchConfiguration('visualize'))
+        # ),
+
+        # Node(
+        #     package='gnn_object_segmentation',
+        #     executable='arena_marker_node',
+        #     name='arena_marker_node',
+        #     output='screen',
+        #     parameters=[{'use_sim_time': LaunchConfiguration('use_sim_time')}],
+        #     condition=IfCondition(LaunchConfiguration('visualize'))
         # ),
     ])
